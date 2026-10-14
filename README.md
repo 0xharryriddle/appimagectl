@@ -34,8 +34,9 @@ The install dialog: inspect-then-confirm. Nothing is written until
   validates it with `desktop-file-validate`, refreshes caches.
 - **Safe uninstall** — deletes only manifest-listed files; moves the binary to
   trash (never hard-deletes it); refuses to touch launchers it did not create.
-- **Adopt** — claim an existing manual install into management without
-  reinstalling.
+- **Adopt / repair launcher** — claim a manual install or explicitly restore a
+  lost managed marker. Recovery checks the existing manifest's launcher path,
+  binary path and SHA-256, keeping the manifest and other launcher fields intact.
 - **Clean** — move an app's user data (config/cache/data/state/dot-dirs) to
   trash; warns when the app is still running.
 - **Verify** — re-hash the binary against the manifest, check launcher
@@ -92,6 +93,39 @@ appimagectl gui                               # GTK4 front end
 Every command supports `--json` for machine-readable output. Add
 `--dry-run` to any destructive command to see the plan without touching the
 system.
+
+### Recover a launcher that lost its managed marker
+
+An application or another tool can rewrite its desktop entry and remove
+`X-AppImageCtl-Managed=true`. Uninstall still refuses that launcher, including
+in dry-run mode. In the GUI, use **Repair launcher → Repair**, review the plan,
+then confirm; **Uninstall** becomes available after recovery.
+
+The existing `adopt` command performs the same explicit recovery. With an
+existing manifest, it refuses a different launcher/binary path, a changed
+binary hash, a symlinked launcher or ambiguous desktop entry. It does not
+rebuild the manifest or expand the list of files managed by uninstall.
+
+Verified on an installed ZCode binary:
+
+```bash
+appimagectl --json adopt zcode \
+  --binary "$HOME/Applications/ZCode-3.10.1-linux-x64.AppImage" --dry-run
+```
+
+The command returned `"ok": true`, `"dry_run": true`, and a plan restoring
+`X-AppImageCtl-Managed=true`, `X-AppImageCtl-Id=zcode` and the binary's matching
+`X-AppImageCtl-Sha256`. Dry-run did not change the launcher or manifest.
+
+Executing the same adoption without `--dry-run` returned `"ok": true`; the
+original manifest stayed byte-for-byte identical. The subsequent
+`appimagectl --json verify zcode` returned `"ok": true` for all four checks.
+`appimagectl --json uninstall zcode --dry-run` then listed the launcher,
+nine recorded icons and the binary's trash destination. Finally,
+`appimagectl --json uninstall zcode` returned `"ok": true`, removed those
+ten integration files and moved the binary into trash. Its SHA-256 still
+matched the original manifest; ZCode was no longer registered in the shell.
+
 
 ### Quick tour
 

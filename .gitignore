@@ -7,3 +7,5 @@ build/
 .pytest_cache/
 .ruff_cache/
 *.pyo
+# CocoIndex Code (ccc)
+/.cocoindex_code/

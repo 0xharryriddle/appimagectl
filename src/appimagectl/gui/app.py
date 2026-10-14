@@ -24,6 +24,7 @@ from gi.repository import Adw, Gio, GLib, Gtk  # type: ignore[attr-defined]  # n
 from .. import __version__  # noqa: E402
 from ..core import (  # noqa: E402
     OperationError,
+    op_adopt,
     op_doctor,
     op_inspect,
     op_install,
@@ -150,6 +151,16 @@ class DetailPane(Gtk.Box):
         clean.add_suffix(btn_clean)
         actions.add(clean)
 
+        if managed is False:
+            repair = Adw.ActionRow(
+                title="Repair launcher",
+                subtitle="Verify the recorded binary and restore launcher ownership",
+            )
+            btn_repair = Gtk.Button(label="Repair", valign=Gtk.Align.CENTER)
+            btn_repair.connect("clicked", self._on_repair)
+            repair.add_suffix(btn_repair)
+            actions.add(repair)
+
         rm = Adw.ActionRow(
             title="Uninstall",
             subtitle="Delete launcher and icons; move the binary to trash",
@@ -157,6 +168,11 @@ class DetailPane(Gtk.Box):
         btn_rm = Gtk.Button(label="Uninstall", valign=Gtk.Align.CENTER)
         btn_rm.add_css_class("destructive-action")
         btn_rm.connect("clicked", self._on_uninstall)
+        try:
+            op_uninstall(entry["app_id"], dry_run=True)
+        except OperationError as exc:
+            btn_rm.set_sensitive(False)
+            btn_rm.set_tooltip_text(str(exc))
         rm.add_suffix(btn_rm)
         actions.add(rm)
 
@@ -258,6 +274,64 @@ class DetailPane(Gtk.Box):
         self.window.begin_operation(f"Cleaning {app_id}")
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_repair(self, _btn: Gtk.Button) -> None:
+        assert self.app_entry
+        app_id = self.app_entry["app_id"]
+        binary = self.app_entry["binary"]
+        name = self.app_entry["name"]
+        self.window.begin_operation(f"Checking launcher recovery for {app_id}")
+
+        def work() -> None:
+            try:
+                preview = op_adopt(app_id, binary=binary, dry_run=True)
+            except OperationError as exc:
+                GLib.idle_add(self.window.finish_operation, str(exc))
+                return
+            GLib.idle_add(self._show_repair_plan, app_id, binary, name, preview["plan"])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_repair_plan(self, app_id: str, binary: str, name: str, plan: dict) -> bool:
+        self.window.finish_operation(f"Launcher recovery checks passed for {app_id}")
+        body = [
+            f"Launcher to repair:\n  {plan['desktop_file']}",
+            f"Verified binary (not moved):\n  {plan['binary']}",
+            "Main Desktop Entry keys to restore:",
+        ]
+        body += [f"  {key}" for key in plan["add_keys"]]
+        body.append("\nThe existing manifest and other launcher fields remain unchanged.")
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            heading=f"Repair launcher for {name}?",
+            body="\n".join(body),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("repair", "Repair")
+        dialog.set_response_appearance("repair", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_repair_response, app_id, binary)
+        dialog.present()
+        return False
+
+    def _on_repair_response(
+        self, dialog: Adw.MessageDialog, response: str, app_id: str, binary: str,
+    ) -> None:
+        dialog.close()
+        if response != "repair":
+            return
+
+        def work() -> None:
+            try:
+                op_adopt(app_id, binary=binary)
+                msg = f"Repaired launcher for {app_id}"
+            except OperationError as exc:
+                msg = str(exc)
+            GLib.idle_add(self.window.finish_operation, msg)
+
+        self.window.begin_operation(f"Repairing launcher for {app_id}")
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_uninstall(self, _btn: Gtk.Button) -> None:
         assert self.app_entry
         entry = self.app_entry
@@ -265,6 +339,8 @@ class DetailPane(Gtk.Box):
         try:
             plan = op_uninstall(app_id, dry_run=True)
         except OperationError as exc:
+            _btn.set_sensitive(False)
+            _btn.set_tooltip_text(str(exc))
             self.window.toast(str(exc))
             return
 

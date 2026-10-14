@@ -135,7 +135,8 @@ def test_uninstall_refuses_when_manifest_lost_but_launcher_managed(sandbox, fake
     assert Path(res["installed"]["binary"]).is_file()
 
 
-def test_uninstall_refuses_if_marker_stripped(sandbox, fake_appimage):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_uninstall_refuses_if_marker_stripped(sandbox, fake_appimage, dry_run):
     """Someone hand-edited our launcher: we no longer own it, so we stop."""
     core = sandbox["core"]
     res = core.op_install(fake_appimage)
@@ -143,7 +144,7 @@ def test_uninstall_refuses_if_marker_stripped(sandbox, fake_appimage):
     desktop_file.write_text("[Desktop Entry]\nName=Rewritten By Hand\nExec=/bin/true\n")
 
     with pytest.raises(core.OperationError, match="lost its managed marker"):
-        core.op_uninstall(res["app_id"])
+        core.op_uninstall(res["app_id"], dry_run=dry_run)
     assert desktop_file.is_file()
 
 
@@ -271,7 +272,6 @@ def test_adopt_claims_manual_install(sandbox, fake_appimage):
     res = core.op_adopt("sometool")
     assert res["ok"]
     assert res["binary"] == str(binary)
-    assert res["sha256"] == fake_appimage.read_bytes().__str__() or True  # non-empty
     assert dsk.is_managed(dsk.desktop_path_for("sometool"))
     m = manifest_mod.Manifest.load("sometool")
     assert m is not None and m.name == "Some Tool"
@@ -396,3 +396,176 @@ def test_adopt_survives_second_adopt_after_uninstall_refusal(sandbox, fake_appim
     with pytest.raises(core.OperationError, match="lost its managed marker"):
         core.op_uninstall("sometool")
     assert binary.is_file()
+
+
+def test_adopt_repairs_launcher_without_rewriting_manifest(sandbox, fake_appimage):
+    core, dsk, manifests = sandbox["core"], sandbox["desktop"], sandbox["manifest"]
+    installed = core.op_install(fake_appimage, app_id="repair-me")
+    binary = Path(installed["installed"]["binary"])
+    payload = binary.read_bytes()
+    desktop_file = dsk.desktop_path_for("repair-me")
+    icon_dir = sandbox["paths"].ICONS_DIR / "256x256" / "apps"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    recorded_icon = icon_dir / "recorded.png"
+    recorded_icon.write_bytes(b"recorded icon")
+    unrelated_icon = icon_dir / "custom.png"
+    unrelated_icon.write_bytes(b"not ours")
+    manifest_file = manifests.Manifest.path_for("repair-me")
+    data = json.loads(manifest_file.read_text())
+    data.update(
+        icon_files=[str(recorded_icon)],
+        mime_types=["application/original"],
+        update_information="original update information",
+        future_metadata={"preserve": True},
+    )
+    manifest_file.write_text(json.dumps(data, indent=4) + "\n")
+    original_manifest = manifest_file.read_bytes()
+    original_launcher = (
+        "# user customizations\n[Desktop Entry]\nName=Custom Name\n"
+        f'Exec="{binary}" --custom "two words" %U\n'
+        "MimeType=application/custom;x-scheme-handler/custom;\n"
+        "Icon=custom\nActions=NewWindow;\n\n"
+        "[Desktop Action NewWindow]\nName=New Window\nExec=/bin/true --new-window\n"
+    )
+    desktop_file.write_text(original_launcher)
+
+    preview = core.op_adopt("repair-me", dry_run=True)
+    assert preview["plan"]["binary"] == str(binary)
+    assert desktop_file.read_text() == original_launcher
+    assert manifest_file.read_bytes() == original_manifest
+    assert not dsk.is_managed(desktop_file)
+
+    repaired = core.op_adopt("repair-me", binary=binary)
+    assert repaired["ok"]
+    assert manifest_file.read_bytes() == original_manifest
+    repaired_launcher = desktop_file.read_text()
+    main, action = repaired_launcher.split("[Desktop Action NewWindow]", 1)
+    assert "X-AppImageCtl-Managed=true\n" in main
+    assert action == original_launcher.split("[Desktop Action NewWindow]", 1)[1]
+    assert "".join(
+        line for line in repaired_launcher.splitlines(keepends=True)
+        if not line.startswith((dsk.MANAGED_KEY + "=", dsk.APP_ID_KEY + "=", dsk.SHA_KEY + "="))
+    ) == original_launcher
+    assert core.op_list()["apps"][0]["desktop_managed"] is True
+
+    removed = core.op_uninstall("repair-me")
+    assert set(removed["removed"]) == {str(desktop_file), str(recorded_icon)}
+    assert Path(removed["trashed_binary"]).read_bytes() == payload
+    assert not binary.exists()
+    assert not manifest_file.exists()
+    assert unrelated_icon.read_bytes() == b"not ours"
+    assert fake_appimage.read_bytes() == payload
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("damage", ["exec", "hash", "desktop_path", "symlink"])
+def test_adopt_refuses_unsafe_launcher_recovery(sandbox, fake_appimage, dry_run, damage):
+    core, dsk, manifests = sandbox["core"], sandbox["desktop"], sandbox["manifest"]
+    installed = core.op_install(fake_appimage, app_id="repair-me")
+    binary = Path(installed["installed"]["binary"])
+    desktop_file = dsk.desktop_path_for("repair-me")
+    desktop_file.write_text(f'[Desktop Entry]\nName=Custom\nExec="{binary}" %U\n')
+    manifest_file = manifests.Manifest.path_for("repair-me")
+    if damage == "exec":
+        other = binary.with_name("other.AppImage")
+        other.write_bytes(binary.read_bytes())
+        desktop_file.write_text(f'[Desktop Entry]\nExec="{other}" %U\n')
+    elif damage == "hash":
+        binary.write_bytes(binary.read_bytes() + b"modified")
+    elif damage == "desktop_path":
+        data = json.loads(manifest_file.read_text())
+        data["desktop_file"] = str(desktop_file.with_name("other.desktop"))
+        manifest_file.write_text(json.dumps(data))
+    else:
+        real_launcher = desktop_file.with_name("real.desktop")
+        desktop_file.rename(real_launcher)
+        desktop_file.symlink_to(real_launcher)
+    before = {p: p.read_bytes() for p in sandbox["home"].rglob("*") if p.is_file()}
+    symlinks = {p: p.readlink() for p in before if p.is_symlink()}
+
+    with pytest.raises(core.OperationError):
+        core.op_adopt("repair-me", dry_run=dry_run)
+
+    assert {p: p.read_bytes() for p in sandbox["home"].rglob("*") if p.is_file()} == before
+    assert {p: p.readlink() for p in before if p.is_symlink()} == symlinks
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("entry", [
+    '[Desktop Entry]\nExec="{binary}\n',
+    '[Desktop Entry]\nExec="" %U\n',
+    '[Desktop Entry]\nExec=relative.AppImage %U\n',
+    '[Desktop Entry]\nExec="{binary}"\nExec=/bin/true\n',
+    '[Desktop Entry]\nExec="{binary}"\nExec =/other/program\n',
+    '[Desktop Entry]\nExec="{binary}"\n Exec = /other/program\n',
+    '[Desktop Entry]\nExec="{binary}"\n[Desktop Entry]\nExec=/bin/true\n',
+    '[Desktop Entry]\nName=Missing Exec\n[Desktop Action Open]\nExec="{binary}"\n',
+])
+def test_adopt_refuses_ambiguous_or_malformed_exec(sandbox, fake_appimage, dry_run, entry):
+    core, dsk = sandbox["core"], sandbox["desktop"]
+    binary = _write_manual_install(sandbox, fake_appimage)
+    desktop_file = dsk.desktop_path_for("sometool")
+    desktop_file.write_text(entry.format(binary=binary))
+    before = {p: p.read_bytes() for p in sandbox["home"].rglob("*") if p.is_file()}
+    with pytest.raises(core.OperationError):
+        core.op_adopt("sometool", dry_run=dry_run)
+    assert {p: p.read_bytes() for p in sandbox["home"].rglob("*") if p.is_file()} == before
+
+
+def test_adopt_uses_main_group_not_desktop_action(sandbox, fake_appimage):
+    core, dsk = sandbox["core"], sandbox["desktop"]
+    binary = _write_manual_install(sandbox, fake_appimage)
+    desktop_file = dsk.desktop_path_for("sometool")
+    desktop_file.write_text(
+        "[Desktop Action Open]\nName=Action\nExec=/bin/true\n\n"
+        f'[Desktop Entry]\nName=Main\nExec="{binary}" %U\n'
+    )
+    core.op_adopt("sometool")
+    assert dsk.read_desktop_key(desktop_file, "Exec") == f'"{binary}" %U'
+    assert dsk.read_desktop_key(desktop_file, "Name") == "Main"
+    assert dsk.is_managed(desktop_file)
+    assert "[Desktop Action Open]\nName=Action\nExec=/bin/true\n\n" in desktop_file.read_text()
+
+
+def test_adopt_repair_does_not_follow_predictable_temp_symlink(sandbox, fake_appimage):
+    core, dsk, manifests = sandbox["core"], sandbox["desktop"], sandbox["manifest"]
+    installed = core.op_install(fake_appimage, app_id="repair-me")
+    binary = Path(installed["installed"]["binary"])
+    desktop_file = dsk.desktop_path_for("repair-me")
+    desktop_file.write_text(f'[Desktop Entry]\nName=Custom\nExec="{binary}" %U\n')
+    victim = sandbox["home"] / "unrelated.txt"
+    victim.write_bytes(b"unrelated user data")
+    victim.chmod(0o600)
+    victim_mode = victim.stat().st_mode
+    old_temp = desktop_file.with_suffix(".desktop.tmp")
+    old_temp.symlink_to(victim)
+    manifest_file = manifests.Manifest.path_for("repair-me")
+    manifest_bytes = manifest_file.read_bytes()
+
+    core.op_adopt("repair-me")
+
+    assert dsk.is_managed(desktop_file)
+    assert manifest_file.read_bytes() == manifest_bytes
+    assert victim.read_bytes() == b"unrelated user data"
+    assert victim.stat().st_mode == victim_mode
+    assert old_temp.is_symlink()
+    assert old_temp.readlink() == victim
+
+
+def test_adopt_repair_replaces_spaced_provenance_keys(sandbox, fake_appimage):
+    core, dsk = sandbox["core"], sandbox["desktop"]
+    installed = core.op_install(fake_appimage, app_id="repair-me")
+    binary = Path(installed["installed"]["binary"])
+    desktop_file = dsk.desktop_path_for("repair-me")
+    desktop_file.write_text(
+        f'[Desktop Entry]\nName=Custom\nExec = "{binary}" %U\n'
+        " X-AppImageCtl-Managed = false\nX-AppImageCtl-Id = old-id\n"
+        "X-AppImageCtl-Sha256 = stale\n"
+    )
+
+    core.op_adopt("repair-me")
+
+    assert dsk.is_managed(desktop_file)
+    assert dsk.read_desktop_key(desktop_file, dsk.APP_ID_KEY) == "repair-me"
+    assert dsk.read_desktop_key(desktop_file, dsk.SHA_KEY) == installed["app"]["sha256"]
+    assert core.op_uninstall("repair-me", dry_run=True)["ok"]

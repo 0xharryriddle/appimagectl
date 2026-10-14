@@ -279,7 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_a = sub.add_parser(
         "adopt",
-        help="claim an existing manual AppImage install into management",
+        help="adopt a manual install or repair a verified launcher's missing managed marker",
+        description=(
+            "Adopt an existing AppImage launcher, or restore a missing managed marker "
+            "after checking the installed manifest's launcher path, binary and SHA-256. "
+            "Launcher recovery preserves the existing manifest and custom launcher fields."
+        ),
     )
     p_a.add_argument("app_id")
     p_a.add_argument("--binary", help="expected binary; must match Exec= in the desktop entry")

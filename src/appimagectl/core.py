@@ -9,6 +9,7 @@ Design rules:
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
@@ -226,6 +227,14 @@ def op_uninstall(
             "the manifest, then uninstall."
         )
 
+    recorded_desktop = Path(manifest.desktop_file)
+    if recorded_desktop.exists() and not dsk.is_managed(recorded_desktop):
+        raise OperationError(
+            f"{recorded_desktop} lost its managed marker; refusing to delete. "
+            f"Use 'appimagectl adopt {app_id} --dry-run' to check explicit launcher "
+            f"recovery, then 'appimagectl adopt {app_id}' if the checks succeed."
+        )
+
     to_remove = [Path(manifest.desktop_file), *(Path(p) for p in manifest.icon_files)]
     binary = Path(manifest.appimage_path)
     trash_target = TRASH_DIR / binary.name
@@ -243,13 +252,6 @@ def op_uninstall(
             "app_id": app_id,
             "plan": plan,
         }
-
-    if Path(manifest.desktop_file).exists() and not dsk.is_managed(
-        Path(manifest.desktop_file)
-    ):
-        raise OperationError(
-            f"{manifest.desktop_file} lost its managed marker; refusing to delete"
-        )
 
     removed, skipped = [], []
     for p in to_remove:
@@ -288,15 +290,14 @@ def op_adopt(
     *,
     dry_run: bool = False,
 ) -> dict:
-    """Claim an existing, manually-installed AppImage into management.
+    """Adopt a manual install, or explicitly restore a verified installed launcher.
 
-    Adopt does not move or rewrite anything except adding our provenance keys to
-    the .desktop file. It refuses when the desktop entry does not exist, when it
-    is already managed, or when its Exec= does not point at the given (or
-    discovered) AppImage - otherwise we would be claiming files we cannot vouch
-    for.
+    Recovery requires the original launcher path, Exec binary and recorded hash;
+    it adds provenance only and never rewrites the existing manifest.
     """
     desktop_file = dsk.desktop_path_for(app_id)
+    if desktop_file.is_symlink():
+        raise OperationError(f"{desktop_file} is a symlink; refusing to adopt")
     if not desktop_file.is_file():
         raise OperationError(
             f"no desktop entry at {desktop_file}; use 'install' instead of 'adopt'"
@@ -310,11 +311,29 @@ def op_adopt(
     # manifest, or the manifest was deleted). Re-adopting is the correct
     # recovery - adopt only ever writes the same keys and the manifest.
 
-    exec_line = dsk.read_desktop_key(desktop_file, "Exec") or ""
+    exec_line = dsk.read_desktop_key(desktop_file, "Exec")
     if not exec_line:
-        raise OperationError(f"{desktop_file} has no Exec= line; refusing")
-    exec_binary = Path(exec_line.split('"')[1] if '"' in exec_line else exec_line.split()[0])
-    exec_binary = exec_binary.expanduser().resolve()
+        raise OperationError(f"{desktop_file} has no unambiguous main-group Exec=; refusing")
+    try:
+        tokens = shlex.split(exec_line)
+    except ValueError as exc:
+        raise OperationError(f"malformed Exec= in {desktop_file}: {exc}; refusing") from exc
+    if not tokens or not tokens[0] or not Path(tokens[0]).is_absolute() or "%" in tokens[0]:
+        raise OperationError(f"Exec= must name an absolute AppImage binary; refusing: {exec_line}")
+    exec_binary = Path(tokens[0]).resolve()
+
+    if manifest_already is not None:
+        if Path(manifest_already.desktop_file) != desktop_file:
+            raise OperationError(
+                f"manifest desktop_file is {manifest_already.desktop_file}, not "
+                f"{desktop_file}; refusing launcher recovery"
+            )
+        recorded_binary = Path(manifest_already.appimage_path).expanduser().resolve()
+        if exec_binary != recorded_binary:
+            raise OperationError(
+                f"Exec= points at {exec_binary}, not manifest binary {recorded_binary}; "
+                "refusing launcher recovery"
+            )
 
     if binary is not None:
         wanted = Path(binary).expanduser().resolve()
@@ -333,6 +352,11 @@ def op_adopt(
         raise OperationError(f"Exec= target is not an AppImage: {exc}") from exc
 
     sha = sha256_file(exec_binary)
+    if manifest_already is not None and sha != manifest_already.sha256:
+        raise OperationError(
+            f"binary sha256 {sha} does not match manifest sha256 {manifest_already.sha256}; "
+            "refusing launcher recovery"
+        )
     plan = {
         "desktop_file": str(desktop_file),
         "binary": str(exec_binary),
@@ -342,44 +366,41 @@ def op_adopt(
             f"{dsk.SHA_KEY}={sha}",
         ],
     }
+    try:
+        with desktop_file.open(encoding="utf-8", newline="") as launcher:
+            text = dsk.with_provenance(launcher.read(), app_id, sha)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OperationError(f"cannot safely repair {desktop_file}: {exc}") from exc
     if dry_run:
         return {"ok": True, "action": "adopt", "dry_run": True, "app_id": app_id, "plan": plan}
 
-    text = desktop_file.read_text(encoding="utf-8", errors="replace")
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    for key in (dsk.MANAGED_KEY, dsk.APP_ID_KEY, dsk.SHA_KEY):
-        lines = [ln for ln in lines if not ln.startswith(key + "=")]
-    lines.extend(plan["add_keys"])
-    desktop_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    dsk.write_desktop(text, app_id)
 
-    info = inspect(exec_binary, compute_sha=False, deep=False)
-    entry_name = dsk.read_desktop_key(desktop_file, "Name") or info.display_name
-    entry_version = dsk.read_desktop_key(desktop_file, "X-AppImage-Version")
-    # Adopted apps may already have icons in the theme (installed by hand or by
-    # a prior tool). Record exactly those named after this app so uninstall can
-    # clean them too; a scoped glob can never match another app's icons. An
-    # absolute Icon= path (e.g. ~/Applications/orca/icon.png) deliberately does
-    # NOT count: that icon lives outside the theme and belongs to the app's own
-    # directory, not to launcher management.
-    icon_name = dsk.read_desktop_key(desktop_file, "Icon") or app_id
-    icon_files: list[str] = []
-    if icon_name and not Path(icon_name).is_absolute():
-        icon_files = sorted(str(p) for p in ICONS_DIR.rglob(f"{icon_name}.*"))
-    manifest = Manifest(
-        schema_version=SCHEMA_VERSION,
-        app_id=app_id,
-        name=entry_name,
-        appimage_path=str(exec_binary),
-        sha256=sha,
-        version=entry_version,
-        installed_at=now_iso(),
-        desktop_file=str(desktop_file),
-        icon_files=icon_files,
-        mime_types=info.desktop.mime_types,
-        source_path=None,
-        update_information=info.update_information,
-    )
-    manifest.save()
+    if manifest_already is None:
+        info = inspect(exec_binary, compute_sha=False, deep=False)
+        entry_name = dsk.read_desktop_key(desktop_file, "Name") or info.display_name
+        entry_version = dsk.read_desktop_key(desktop_file, "X-AppImage-Version")
+        # Only manual adoption discovers theme icons. Recovery keeps its recorded
+        # deletion list, even when a rewritten launcher references another icon.
+        icon_name = dsk.read_desktop_key(desktop_file, "Icon") or app_id
+        icon_files: list[str] = []
+        if icon_name and not Path(icon_name).is_absolute():
+            icon_files = sorted(str(p) for p in ICONS_DIR.rglob(f"{icon_name}.*"))
+        manifest = Manifest(
+            schema_version=SCHEMA_VERSION,
+            app_id=app_id,
+            name=entry_name,
+            appimage_path=str(exec_binary),
+            sha256=sha,
+            version=entry_version,
+            installed_at=now_iso(),
+            desktop_file=str(desktop_file),
+            icon_files=icon_files,
+            mime_types=info.desktop.mime_types,
+            source_path=None,
+            update_information=info.update_information,
+        )
+        manifest.save()
 
     return {
         "ok": True,

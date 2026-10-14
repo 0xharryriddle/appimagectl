@@ -11,6 +11,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Full open-source packaging: MIT `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`,
   generated GUI screenshots for the README.
 
+## [0.2.1] - 2026-10-14
+
+### Added
+
+- GUI **Repair launcher** action: preview and confirm recovery on worker
+  threads, then re-enable ordinary uninstall after the marker is restored.
+
+### Fixed
+
+- Re-adopting a launcher with a lost marker now verifies the recorded launcher,
+  binary path and SHA-256 and preserves the existing manifest byte-for-byte.
+  Custom launcher fields and desktop actions remain intact; provenance keys
+  are restored atomically in the main Desktop Entry group.
+- Adoption rejects symlinked launchers and malformed or ambiguous Exec entries.
+  Desktop ownership checks no longer accept markers in desktop action groups.
+- Uninstall dry-run now applies the same lost-marker guard as execution and
+  points to explicit adoption recovery instead of offering an unusable plan.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added

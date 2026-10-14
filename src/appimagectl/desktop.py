@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .appimage import AppImageInfo
@@ -31,24 +32,55 @@ def desktop_path_for(app_id: str) -> Path:
     return APPLICATIONS_DIR / f"{app_id}.desktop"
 
 
+def _entry_bounds(lines: list[str]) -> tuple[int, int]:
+    """Locate the single main group; actions never establish ownership."""
+    starts = [i for i, line in enumerate(lines) if line.strip() == "[Desktop Entry]"]
+    if len(starts) != 1:
+        raise ValueError("desktop entry must contain exactly one [Desktop Entry] group")
+    start = starts[0] + 1
+    end = next(
+        (i for i in range(start, len(lines)) if lines[i].strip().startswith("[")),
+        len(lines),
+    )
+    return start, end
+
+
 def is_managed(desktop_file: Path) -> bool:
-    """True only when the file exists and declares our marker."""
-    if not desktop_file.is_file():
-        return False
-    try:
-        text = desktop_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return f"{MANAGED_KEY}={MANAGED_VALUE}" in text
+    """True only when the main group unambiguously declares our marker."""
+    return read_desktop_key(desktop_file, MANAGED_KEY) == MANAGED_VALUE
 
 
 def read_desktop_key(desktop_file: Path, key: str) -> str | None:
-    if not desktop_file.is_file():
+    """Read one unambiguous main-group key, never a Desktop Action key."""
+    try:
+        lines = desktop_file.read_text(encoding="utf-8").splitlines()
+        start, end = _entry_bounds(lines)
+    except (OSError, UnicodeError, ValueError):
         return None
-    for line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.startswith(f"{key}="):
-            return line.split("=", 1)[1].strip()
-    return None
+    values = [
+        line.split("=", 1)[1].strip() for line in lines[start:end]
+        if "=" in line and line.split("=", 1)[0].strip() == key
+    ]
+    return values[0] if len(values) == 1 else None
+
+
+def with_provenance(text: str, app_id: str, sha: str) -> str:
+    """Replace only our main-group keys, preserving all other launcher text."""
+    lines = text.splitlines(keepends=True)
+    start, end = _entry_bounds(lines)
+    keys = (MANAGED_KEY, APP_ID_KEY, SHA_KEY)
+    main = [line for line in lines[start:end] if line.split("=", 1)[0].strip() not in keys]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if not lines[start - 1].endswith(("\n", "\r")):
+        lines[start - 1] += newline
+    if main and not main[-1].endswith(("\n", "\r")):
+        main[-1] += newline
+    main += [
+        f"{MANAGED_KEY}={MANAGED_VALUE}{newline}",
+        f"{APP_ID_KEY}={app_id}{newline}",
+        f"{SHA_KEY}={sha}{newline}",
+    ]
+    return "".join(lines[:start] + main + lines[end:])
 
 
 def render_desktop(
@@ -120,10 +152,19 @@ def install_icons(icons: dict[int, Path], app_id: str) -> list[Path]:
 def write_desktop(text: str, app_id: str) -> Path:
     APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
     target = desktop_path_for(app_id)
-    tmp = target.with_suffix(".desktop.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o644)
-    tmp.replace(target)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", dir=target.parent,
+            prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            tmp = Path(stream.name)
+            stream.write(text)
+            tmp.chmod(0o644)
+        tmp.replace(target)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return target
 
 
