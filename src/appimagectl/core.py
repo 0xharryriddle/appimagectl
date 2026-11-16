@@ -65,13 +65,29 @@ def human_size(n: int) -> str:
 
 
 def op_inspect(path: str | Path, *, deep: bool = True) -> dict:
+    info = _inspect_appimage(path, deep=deep)
+    return {"ok": True, "action": "inspect", "app": _info_dict(info)}
+
+
+def _inspect_appimage(path: str | Path, *, deep: bool = True) -> AppImageInfo:
+    """Inspect a source AppImage and distinguish missing input from payload I/O errors."""
+    raw_source = Path(path).expanduser()
     try:
-        info = inspect(Path(path), deep=deep)
+        source = raw_source.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise OperationError(f"invalid AppImage path {raw_source}: {exc}") from exc
+    if not source.is_file():
+        if source.exists():
+            raise OperationError(f"not a regular file: {source}")
+        if raw_source.is_symlink():
+            raise OperationError(f"invalid AppImage path {raw_source}: broken or cyclic symlink")
+        raise OperationError(f"file not found: {source}")
+    try:
+        return inspect(source, deep=deep)
     except NotAnAppImage as exc:
         raise OperationError(str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise OperationError(f"file not found: {path}") from exc
-    return {"ok": True, "action": "inspect", "app": _info_dict(info)}
+    except OSError as exc:
+        raise OperationError(f"failed to inspect AppImage {source}: {exc}") from exc
 
 
 def op_install(
@@ -85,13 +101,9 @@ def op_install(
 ) -> dict:
     """Integrate an AppImage: copy into the store, install icons, write and
     validate a managed .desktop entry, record a manifest."""
-    src = Path(path).expanduser().resolve()
-    try:
-        info = inspect(src, deep=True)
-    except NotAnAppImage as exc:
-        raise OperationError(str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise OperationError(f"file not found: {src}") from exc
+    src = Path(path).expanduser()
+    info = _inspect_appimage(src, deep=True)
+    src = info.path
 
     aid = app_id or info.slug
     target = STORE_DIR / src.name

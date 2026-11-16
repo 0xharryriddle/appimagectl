@@ -18,6 +18,16 @@ from pathlib import Path
 import pytest
 
 
+def test_cli_reports_project_release_version(sandbox, capsys):
+    from appimagectl import cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == "appimagectl 0.2.2"
+
+
 def test_human_size_units(sandbox):
     human_size = sandbox["core"].human_size
     assert human_size(512) == "512 B"
@@ -114,6 +124,55 @@ def test_install_reports_missing_file(sandbox, tmp_path):
     core = sandbox["core"]
     with pytest.raises(core.OperationError, match="file not found"):
         core.op_install(tmp_path / "ghost.AppImage")
+
+
+def test_inspect_reports_symlink_loop_as_invalid_path(sandbox, tmp_path):
+    core = sandbox["core"]
+    loop = tmp_path / "loop.AppImage"
+    loop.symlink_to(loop)
+
+    with pytest.raises(core.OperationError, match="invalid AppImage path"):
+        core.op_inspect(loop)
+
+
+@pytest.mark.parametrize("operation", ["inspect", "install"])
+def test_payload_file_error_is_not_reported_as_missing_source(
+    sandbox, fake_appimage, monkeypatch, operation
+):
+    core = sandbox["core"]
+
+    def fail_on_payload(*_args, **_kwargs):
+        raise FileNotFoundError("internal .desktop target is missing")
+
+    monkeypatch.setattr(core, "inspect", fail_on_payload)
+    with pytest.raises(core.OperationError, match="failed to inspect AppImage"):
+        if operation == "inspect":
+            core.op_inspect(fake_appimage)
+        else:
+            core.op_install(fake_appimage)
+
+    if operation == "install":
+        assert list(sandbox["store"].iterdir()) == []
+        assert sandbox["manifest"].Manifest.all() == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("directory", "not a regular file"),
+        ("broken_symlink", "invalid AppImage path"),
+    ],
+)
+def test_inspect_distinguishes_invalid_source_path(sandbox, tmp_path, kind, message):
+    core = sandbox["core"]
+    path = tmp_path / "invalid.AppImage"
+    if kind == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to(tmp_path / "absent.AppImage")
+
+    with pytest.raises(core.OperationError, match=message):
+        core.op_inspect(path)
 
 
 def test_uninstall_refuses_unknown_app(sandbox):

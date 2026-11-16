@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "appimagectl"
-version = "0.2.1"
+version = "0.2.2"
 description = "Install, uninstall, inspect, update and clean AppImages with safe desktop integration"
 readme = "README.md"
 requires-python = ">=3.11"

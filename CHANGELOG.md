@@ -4,12 +4,20 @@ All notable changes to appimagectl are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-11-16
 
 ### Added
 
 - Full open-source packaging: MIT `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`,
   generated GUI screenshots for the README.
+- Regression coverage for symlink-backed desktop entries, unsafe/dangling
+  payload symlinks, invalid source paths and release-version reporting.
+
+### Fixed
+
+- Inspect and install now resolve internal symlink-backed AppImage desktop
+  entries safely and no longer report payload read failures as missing source
+  files.
 
 ## [0.2.1] - 2026-10-14
 

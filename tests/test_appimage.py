@@ -6,6 +6,7 @@ import hashlib
 
 import pytest
 
+from appimagectl import appimage
 from appimagectl.appimage import (
     NotAnAppImage,
     _parse_desktop_text,
@@ -78,3 +79,69 @@ def test_parse_desktop_ignores_comments_and_blanks():
 def test_parse_desktop_drops_empty_mime_segments():
     meta = _parse_desktop_text("[Desktop Entry]\nMimeType=a/b;;c/d;\n")
     assert meta.mime_types == ["a/b", "c/d"]
+
+
+def test_inspect_reads_internal_target_of_desktop_symlink(fake_appimage, monkeypatch, tmp_path):
+    target_relative = "usr/share/applications/SwiftDL.desktop"
+
+    def extract(_path, pattern, dest):
+        root = dest / "squashfs-root"
+        root.mkdir(parents=True, exist_ok=True)
+        if pattern == "*.desktop":
+            (root / "SwiftDL.desktop").symlink_to(target_relative)
+            return True
+        if pattern == target_relative:
+            target = root / target_relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "[Desktop Entry]\nName=SwiftDL\nExec=swiftdl-app\n",
+                encoding="utf-8",
+            )
+            return True
+        return False
+
+    monkeypatch.setattr(appimage, "_extract", extract)
+    monkeypatch.setattr(appimage, "_run_appimage_flag", lambda *_args, **_kwargs: None)
+
+    result = appimage.inspect(fake_appimage, compute_sha=False)
+
+    assert result.desktop.name == "SwiftDL"
+    assert result.desktop.exec_line == "swiftdl-app"
+
+
+def test_inspect_ignores_desktop_symlink_escaping_appdir(fake_appimage, monkeypatch, tmp_path):
+    outside = tmp_path / "outside.desktop"
+    outside.write_text("[Desktop Entry]\nName=Outside payload\n", encoding="utf-8")
+
+    def extract(_path, pattern, dest):
+        if pattern != "*.desktop":
+            return False
+        root = dest / "squashfs-root"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "malicious.desktop").symlink_to(outside)
+        return True
+
+    monkeypatch.setattr(appimage, "_extract", extract)
+    monkeypatch.setattr(appimage, "_run_appimage_flag", lambda *_args, **_kwargs: None)
+
+    result = appimage.inspect(fake_appimage, compute_sha=False)
+
+    assert result.desktop.name is None
+
+
+def test_inspect_skips_dangling_desktop_symlink(fake_appimage, monkeypatch):
+    def extract(_path, pattern, dest):
+        if pattern != "*.desktop":
+            return False
+        root = dest / "squashfs-root"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "missing.desktop").symlink_to("usr/share/applications/missing.desktop")
+        return True
+
+    monkeypatch.setattr(appimage, "_extract", extract)
+    monkeypatch.setattr(appimage, "_run_appimage_flag", lambda *_args, **_kwargs: None)
+
+    result = appimage.inspect(fake_appimage, compute_sha=False)
+
+    assert result.desktop.name is None
+    assert result.appimage_type == 2

@@ -188,6 +188,51 @@ def _run_appimage_flag(path: Path, flag: str, timeout: int = 60) -> str | None:
     return (proc.stdout + proc.stderr).strip() or None
 
 
+def _desktop_entry_target(entry: Path, root: Path, runner: Path, workdir: Path) -> Path | None:
+    """Return a readable desktop entry, extracting an internal symlink target if needed.
+
+    Some AppImages place a top-level ``*.desktop`` symlink in the AppDir while its
+    target lives under ``usr/share/applications``. Only follow targets contained
+    within the extracted AppDir; never read a symlink that escapes it.
+    """
+    root_resolved = root.resolve()
+    try:
+        candidate = entry.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if not candidate.is_relative_to(root_resolved):
+        return None
+    if candidate.is_file():
+        return candidate
+    if not entry.is_symlink():
+        return None
+
+    try:
+        link_target = entry.readlink()
+    except OSError:
+        return None
+    if link_target.is_absolute():
+        return None
+
+    candidate = (entry.parent / link_target).resolve(strict=False)
+    if not candidate.is_relative_to(root_resolved):
+        return None
+    relative_target = candidate.relative_to(root_resolved)
+    pattern = relative_target.as_posix()
+    if not pattern.endswith(".desktop") or any(char in pattern for char in "*?["):
+        return None
+
+    if not _extract(runner, pattern, workdir):
+        return None
+    try:
+        candidate = (root / relative_target).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if not candidate.is_relative_to(root_resolved) or not candidate.is_file():
+        return None
+    return candidate
+
+
 def inspect(path: Path, *, compute_sha: bool = True, deep: bool = True) -> AppImageInfo:
     """Inspect an AppImage.
 
@@ -226,8 +271,11 @@ def inspect(path: Path, *, compute_sha: bool = True, deep: bool = True) -> AppIm
         if _extract(runner, "*.desktop", workdir):
             root = workdir / "squashfs-root"
             for entry in sorted(root.glob("*.desktop")):
+                desktop_entry = _desktop_entry_target(entry, root, runner, workdir)
+                if desktop_entry is None:
+                    continue
                 info.desktop = _parse_desktop_text(
-                    entry.read_text(encoding="utf-8", errors="replace")
+                    desktop_entry.read_text(encoding="utf-8", errors="replace")
                 )
                 break
         shutil.rmtree(workdir / "squashfs-root", ignore_errors=True)
